@@ -1,0 +1,16 @@
+node_modules/
+vendor/
+_tmp_xiaozhi_repo/
+
+trade_calendar_display/build/
+trade_calendar_server/__pycache__/
+trade_calendar_server/data/uploads/
+trade_calendar_server/data/last_pdf_text.txt
+
+outputs/
+*.pyc
+*.pyo
+*.log
+.venv/
+Thumbs.db
+.DS_Store
