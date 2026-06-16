@@ -13,6 +13,7 @@ from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib import request
 from urllib.parse import parse_qs, urlparse
 
 from pypdf import PdfReader
@@ -24,6 +25,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 CSV_PATH = DATA_DIR / "schedule.csv"
 JSON_PATH = DATA_DIR / "schedule.json"
 RAW_TEXT_PATH = DATA_DIR / "last_pdf_text.txt"
+BOARD_URL_PATH = DATA_DIR / "board_url.txt"
 PORT = 8080
 
 
@@ -50,6 +52,36 @@ def local_ip() -> str:
         return "127.0.0.1"
     finally:
         sock.close()
+
+
+def read_board_url() -> str:
+    if not BOARD_URL_PATH.exists():
+        return ""
+    return BOARD_URL_PATH.read_text(encoding="utf-8").strip()
+
+
+def save_board_url(board_url: str) -> str:
+    board_url = board_url.strip().rstrip("/")
+    if board_url and not board_url.startswith(("http://", "https://")):
+        board_url = f"http://{board_url}"
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BOARD_URL_PATH.write_text(board_url, encoding="utf-8")
+    return board_url
+
+
+def notify_board_refresh() -> str:
+    board_url = read_board_url()
+    if not board_url:
+        return "开发板地址未设置，CSV 已更新但未自动刷新开发板"
+    url = f"{board_url.rstrip('/')}/refresh"
+    try:
+        with request.urlopen(url, timeout=8) as response:
+            status = response.status
+            if 200 <= status < 300:
+                return f"已通知开发板刷新：{url}"
+            return f"开发板刷新请求返回 {status}：{url}"
+    except OSError as exc:
+        return f"开发板刷新失败：{exc}"
 
 
 def read_pdf_text(pdf_path: Path) -> str:
@@ -299,6 +331,8 @@ def current_month_day(rows: list[dict[str, str]], query: dict[str, list[str]]) -
 def render_page(message: str = "", query: dict[str, list[str]] | None = None) -> bytes:
     query = query or {}
     ip = local_ip()
+    board_url = read_board_url()
+    board_url_value = html.escape(board_url, quote=True)
     rows = load_events()
     year, month, selected_day = current_month_day(rows, query)
     selected_date = f"{year:04d}年{month:02d}月"
@@ -426,6 +460,8 @@ def render_side_panel(rows: list[dict[str, str]], year: int, month: int, selecte
 def render_page(message: str = "", query: dict[str, list[str]] | None = None) -> bytes:
     query = query or {}
     ip = local_ip()
+    board_url = read_board_url()
+    board_url_value = html.escape(board_url, quote=True)
     rows = load_events()
     year, month, selected_day = current_month_day(rows, query)
     selected_date = f"{year:04d}年{month:02d}月"
@@ -521,6 +557,7 @@ def render_page(message: str = "", query: dict[str, list[str]] | None = None) ->
     }}
     .stat span {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; }}
     .stat strong {{ display: block; margin-top: 4px; font-size: 20px; }}
+    .upload {{ display: grid; gap: 8px; justify-items: end; }}
     .upload form {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }}
     .upload input[type=file] {{
       max-width: 210px;
@@ -528,6 +565,15 @@ def render_page(message: str = "", query: dict[str, list[str]] | None = None) ->
       border-radius: 6px;
       padding: 7px;
       background: #fff;
+    }}
+    .upload input[type=url], .upload input[type=text] {{
+      width: 240px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fff;
+      font-weight: 700;
+      color: #24364a;
     }}
     button {{
       border: 0;
@@ -985,11 +1031,17 @@ def render_page(message: str = "", query: dict[str, list[str]] | None = None) ->
       </div>
       <div class="upload">
         {"<p class='ok'>" + html.escape(message) + "</p>" if message else ""}
+        <form method="POST" action="/device">
+          <input type="url" name="board_url" placeholder="http://开发板IP" value="{board_url_value}">
+          <button type="submit">保存开发板</button>
+          <a class="month-nav" href="/device/refresh">测试刷新</a>
+        </form>
         <form method="POST" action="/upload" enctype="multipart/form-data">
           <input type="file" name="pdf" accept="application/pdf,.pdf" required>
           <button type="submit">上传并转换 PDF</button>
           <a class="month-nav" href="/schedule.csv">下载 CSV</a>
           <div class="device-url">开发板读取 <code>http://{ip}:{PORT}/schedule.csv</code></div>
+          <div class="device-url">开发板控制 <code>{html.escape(board_url or "未设置")}</code></div>
         </form>
       </div>
     </section>
@@ -1055,10 +1107,30 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_bytes(404, "text/plain; charset=utf-8", "schedule.json not found".encode("utf-8"))
             return
+        if path == "/device/refresh":
+            self.send_bytes(200, "text/html; charset=utf-8", render_page(notify_board_refresh(), query=query))
+            return
         self.send_bytes(404, "text/plain; charset=utf-8", "not found".encode("utf-8"))
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/upload":
+        path = urlparse(self.path).path
+        if path == "/device":
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(content_length).decode("utf-8", errors="ignore")
+            fields = parse_qs(body)
+            board_url = save_board_url(fields.get("board_url", [""])[0])
+            if board_url:
+                message = f"开发板地址已保存：{board_url}"
+            else:
+                message = "已清空开发板地址"
+            self.send_bytes(200, "text/html; charset=utf-8", render_page(message))
+            return
+
+        if path == "/device/refresh":
+            self.send_bytes(200, "text/html; charset=utf-8", render_page(notify_board_refresh()))
+            return
+
+        if path != "/upload":
             self.send_bytes(404, "text/plain; charset=utf-8", "not found".encode("utf-8"))
             return
 
@@ -1079,10 +1151,11 @@ class Handler(BaseHTTPRequestHandler):
         events = parse_events_from_text(text)
         merged_events = merge_events_by_month(events)
         write_outputs(merged_events)
+        board_message = notify_board_refresh()
         self.send_bytes(
             200,
             "text/html; charset=utf-8",
-            render_page(f"转换完成：新增/更新 {len(events)} 条记录，当前共 {len(merged_events)} 条记录"),
+            render_page(f"转换完成：新增/更新 {len(events)} 条记录，当前共 {len(merged_events)} 条记录。{board_message}"),
         )
 
 

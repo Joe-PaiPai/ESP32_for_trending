@@ -6,6 +6,7 @@ trade_calendar_display/build/
 trade_calendar_server/__pycache__/
 trade_calendar_server/data/uploads/
 trade_calendar_server/data/last_pdf_text.txt
+trade_calendar_server/data/board_url.txt
 
 outputs/
 *.pyc

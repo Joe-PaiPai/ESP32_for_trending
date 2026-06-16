@@ -23,6 +23,14 @@ http://127.0.0.1:8080/
 http://你的电脑局域网IP:8080/schedule.csv
 ```
 
+网页右上角可以保存开发板地址，例如：
+
+```text
+http://开发板局域网IP
+```
+
+保存后，上传并转换 PDF 会自动请求开发板的 `/refresh` 接口，让开发板重新读取 CSV。
+
 ## ESP32 固件
 
 烧录前在 `trade_calendar_display/trade_calendar_display.ino` 中修改：
@@ -38,6 +46,15 @@ const char *SCHEDULE_URL = "http://YOUR_SERVER_IP:8080/schedule.csv";
 - Flash Size: `16MB`
 - PSRAM: `OPI PSRAM`
 - USB CDC On Boot: `Enabled`
+
+固件启动后会在开发板上开启一个小型 HTTP 控制服务：
+
+- `/refresh`：立即重新读取网页服务上的 `schedule.csv`
+- `/cover`：切回封面
+- `/calendar`：切到日历
+- `/next`：下一天
+- `/prev`：上一天
+- `/status`：返回 JSON 状态
 
 ## 说明
 

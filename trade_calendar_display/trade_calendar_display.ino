@@ -885,6 +885,99 @@ static bool fetchScheduleFromServer() {
   return loadSchedule();
 }
 
+static String jsonEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '"' || c == '\\') {
+      escaped += '\\';
+      escaped += c;
+    } else if (c == '\n') {
+      escaped += "\\n";
+    } else if (c == '\r') {
+      escaped += "\\r";
+    } else {
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
+static String selectedDateString() {
+  char dateText[16];
+  snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d", selectedYear, selectedMonth, selectedDay);
+  return String(dateText);
+}
+
+static void sendJson(const String &body, int statusCode = 200) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(statusCode, "application/json; charset=utf-8", body);
+}
+
+static String statusJson(bool ok = true, const String &message = "ok") {
+  String json = "{";
+  json += "\"ok\":";
+  json += ok ? "true" : "false";
+  json += ",\"message\":\"" + jsonEscape(message) + "\"";
+  json += ",\"page\":\"";
+  json += showCoverPage ? "cover" : "calendar";
+  json += "\",\"selected_date\":\"" + selectedDateString() + "\"";
+  json += ",\"event_count\":" + String(eventCount);
+  json += ",\"selected_event_count\":" + String(countUpcomingOnSelectedDate());
+  json += ",\"wifi_connected\":";
+  json += WiFi.status() == WL_CONNECTED ? "true" : "false";
+  json += ",\"sta_ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += ",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += ",\"schedule_url\":\"" + jsonEscape(String(SCHEDULE_URL)) + "\"";
+  json += ",\"uptime_ms\":" + String(millis());
+  json += "}";
+  return json;
+}
+
+static void handleRefresh() {
+  bool ok = fetchScheduleFromServer();
+  if (!ok) {
+    loadSchedule();
+  }
+  drawScreen();
+  sendJson(statusJson(ok, ok ? "refreshed" : "refresh failed, kept local schedule"), ok ? 200 : 502);
+}
+
+static void handleCover() {
+  showCoverPage = true;
+  lastInteractionMs = millis();
+  drawScreen();
+  sendJson(statusJson(true, "cover"));
+}
+
+static void handleCalendar() {
+  showCoverPage = false;
+  lastInteractionMs = millis();
+  drawScreen();
+  sendJson(statusJson(true, "calendar"));
+}
+
+static void handleNextDay() {
+  showCoverPage = false;
+  lastInteractionMs = millis();
+  changeDay(1);
+  drawScreen();
+  sendJson(statusJson(true, "next"));
+}
+
+static void handlePrevDay() {
+  showCoverPage = false;
+  lastInteractionMs = millis();
+  changeDay(-1);
+  drawScreen();
+  sendJson(statusJson(true, "prev"));
+}
+
+static void handleStatus() {
+  sendJson(statusJson(true, "status"));
+}
+
 static String htmlPage() {
   String page;
   page += "<!doctype html><meta charset='utf-8'><title>Trade Calendar</title>";
@@ -897,6 +990,7 @@ static String htmlPage() {
   page += "<p>Loaded rows: " + String(eventCount) + "</p>";
   page += "<p><a href='/schedule.csv'>Download current CSV</a></p>";
   page += "<p>WiFi IP: " + WiFi.localIP().toString() + " / AP IP: " + WiFi.softAPIP().toString() + "</p>";
+  page += "<p>Control: <a href='/refresh'>refresh</a> · <a href='/cover'>cover</a> · <a href='/calendar'>calendar</a> · <a href='/next'>next</a> · <a href='/prev'>prev</a> · <a href='/status'>status</a></p>";
   return page;
 }
 
@@ -914,6 +1008,18 @@ static void setupWebServer() {
       server.send(404, "text/plain", "No schedule uploaded");
     }
   });
+
+  server.on("/refresh", HTTP_GET, handleRefresh);
+  server.on("/refresh", HTTP_POST, handleRefresh);
+  server.on("/cover", HTTP_GET, handleCover);
+  server.on("/cover", HTTP_POST, handleCover);
+  server.on("/calendar", HTTP_GET, handleCalendar);
+  server.on("/calendar", HTTP_POST, handleCalendar);
+  server.on("/next", HTTP_GET, handleNextDay);
+  server.on("/next", HTTP_POST, handleNextDay);
+  server.on("/prev", HTTP_GET, handlePrevDay);
+  server.on("/prev", HTTP_POST, handlePrevDay);
+  server.on("/status", HTTP_GET, handleStatus);
 
   server.on(
     "/upload",
