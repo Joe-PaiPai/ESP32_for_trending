@@ -6,6 +6,7 @@ import html
 import json
 import re
 import socket
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import date
@@ -27,6 +28,8 @@ JSON_PATH = DATA_DIR / "schedule.json"
 RAW_TEXT_PATH = DATA_DIR / "last_pdf_text.txt"
 BOARD_URL_PATH = DATA_DIR / "board_url.txt"
 PORT = 8080
+DISCOVERY_PORT = 8081
+DISCOVERY_REQUEST = b"TRADE_CALENDAR_DISCOVER"
 
 
 @dataclass
@@ -82,6 +85,62 @@ def notify_board_refresh() -> str:
             return f"开发板刷新请求返回 {status}：{url}"
     except OSError as exc:
         return f"开发板刷新失败：{exc}"
+
+
+BOARD_ACTION_LABELS = {
+    "status": "查看状态",
+    "refresh": "更新",
+    "cover": "封面",
+    "calendar": "日历",
+    "prev": "前一天",
+    "next": "后一天",
+}
+
+
+def notify_board_action(action: str) -> str:
+    if action not in BOARD_ACTION_LABELS:
+        return "未知开发板指令"
+
+    board_url = read_board_url()
+    if not board_url:
+        return "开发板地址未设置"
+
+    url = f"{board_url.rstrip('/')}/{action}"
+    try:
+        with request.urlopen(url, timeout=8) as response:
+            body = response.read().decode("utf-8", errors="replace").strip()
+            label = BOARD_ACTION_LABELS[action]
+            if action == "status" and body:
+                return f"{label}：{body}"
+            if 200 <= response.status < 300:
+                return f"已发送开发板指令：{label}（{url}）"
+            return f"开发板指令返回 {response.status}：{url}"
+    except OSError as exc:
+        return f"开发板指令失败：{exc}"
+
+
+def discovery_response() -> bytes:
+    return f"TRADE_CALENDAR_SERVER http://{local_ip()}:{PORT}/schedule.csv".encode("utf-8")
+
+
+def run_discovery_server() -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", DISCOVERY_PORT))
+    except OSError as exc:
+        print(f"自动发现服务启动失败 UDP {DISCOVERY_PORT}: {exc}")
+        return
+
+    print(f"自动发现服务已启动: UDP {DISCOVERY_PORT}")
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            if data.strip() == DISCOVERY_REQUEST:
+                sock.sendto(discovery_response(), addr)
+        except OSError as exc:
+            print(f"自动发现服务错误: {exc}")
+            time.sleep(1)
 
 
 def read_pdf_text(pdf_path: Path) -> str:
@@ -557,7 +616,50 @@ def render_page(message: str = "", query: dict[str, list[str]] | None = None) ->
     }}
     .stat span {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; }}
     .stat strong {{ display: block; margin-top: 4px; font-size: 20px; }}
-    .upload {{ display: grid; gap: 8px; justify-items: end; }}
+    .upload {{
+      display: grid;
+      grid-template-columns: auto minmax(420px, 1fr);
+      gap: 10px 16px;
+      align-items: start;
+      justify-items: stretch;
+    }}
+    .upload .ok {{ grid-column: 1 / -1; }}
+    .device-actions {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(64px, 1fr));
+      gap: 8px;
+      min-width: 238px;
+      padding-top: 2px;
+    }}
+    .device-actions-title {{
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      line-height: 1;
+    }}
+    .device-action {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 8px 10px;
+      border: 1px solid #cfdceb;
+      border-radius: 9px;
+      background: #f7fbff;
+      color: #203850;
+      font-size: 13px;
+      font-weight: 900;
+      text-decoration: none;
+      white-space: nowrap;
+    }}
+    .device-action.primary {{
+      border-color: #b8d7ff;
+      background: #eaf4ff;
+      color: var(--blue-dark);
+    }}
+    .device-action:hover {{ border-color: var(--blue); background: #edf6ff; }}
+    .upload-forms {{ display: grid; gap: 8px; justify-items: end; }}
     .upload form {{ display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }}
     .upload input[type=file] {{
       max-width: 210px;
@@ -1031,18 +1133,28 @@ def render_page(message: str = "", query: dict[str, list[str]] | None = None) ->
       </div>
       <div class="upload">
         {"<p class='ok'>" + html.escape(message) + "</p>" if message else ""}
-        <form method="POST" action="/device">
-          <input type="url" name="board_url" placeholder="http://开发板IP" value="{board_url_value}">
-          <button type="submit">保存开发板</button>
-          <a class="month-nav" href="/device/refresh">测试刷新</a>
-        </form>
-        <form method="POST" action="/upload" enctype="multipart/form-data">
-          <input type="file" name="pdf" accept="application/pdf,.pdf" required>
-          <button type="submit">上传并转换 PDF</button>
-          <a class="month-nav" href="/schedule.csv">下载 CSV</a>
-          <div class="device-url">开发板读取 <code>http://{ip}:{PORT}/schedule.csv</code></div>
-          <div class="device-url">开发板控制 <code>{html.escape(board_url or "未设置")}</code></div>
-        </form>
+        <div class="device-actions">
+          <div class="device-actions-title">开发板控制</div>
+          <a class="device-action" href="/device/action/status">状态</a>
+          <a class="device-action primary" href="/device/action/refresh">更新</a>
+          <a class="device-action" href="/device/action/cover">封面</a>
+          <a class="device-action" href="/device/action/calendar">日历</a>
+          <a class="device-action" href="/device/action/prev">前一天</a>
+          <a class="device-action" href="/device/action/next">后一天</a>
+        </div>
+        <div class="upload-forms">
+          <form method="POST" action="/device">
+            <input type="url" name="board_url" placeholder="http://开发板IP" value="{board_url_value}">
+            <button type="submit">保存开发板</button>
+          </form>
+          <form method="POST" action="/upload" enctype="multipart/form-data">
+            <input type="file" name="pdf" accept="application/pdf,.pdf" required>
+            <button type="submit">上传并转换 PDF</button>
+            <a class="month-nav" href="/schedule.csv">下载 CSV</a>
+            <div class="device-url">开发板读取 <code>http://{ip}:{PORT}/schedule.csv</code></div>
+            <div class="device-url">开发板控制 <code>{html.escape(board_url or "未设置")}</code></div>
+          </form>
+        </div>
       </div>
     </section>
 
@@ -1110,6 +1222,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/device/refresh":
             self.send_bytes(200, "text/html; charset=utf-8", render_page(notify_board_refresh(), query=query))
             return
+        if path.startswith("/device/action/"):
+            action = path.rsplit("/", 1)[-1]
+            self.send_bytes(200, "text/html; charset=utf-8", render_page(notify_board_action(action), query=query))
+            return
         self.send_bytes(404, "text/plain; charset=utf-8", "not found".encode("utf-8"))
 
     def do_POST(self) -> None:
@@ -1161,6 +1277,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=run_discovery_server, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"交易日历处理系统已启动: http://{local_ip()}:{PORT}")
     print("按 Ctrl+C 停止")

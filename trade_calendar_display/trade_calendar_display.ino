@@ -1,7 +1,9 @@
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <time.h>
 
@@ -26,7 +28,9 @@
 // Change these values before uploading to the board.
 const char *WIFI_SSID = "YOUR_WIFI_NAME";
 const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
-const char *SCHEDULE_URL = "http://YOUR_SERVER_IP:8080/schedule.csv";
+const char *DEFAULT_SCHEDULE_URL = "http://YOUR_SERVER_IP:8080/schedule.csv";
+const uint16_t DISCOVERY_PORT = 8081;
+const char *DISCOVERY_REQUEST = "TRADE_CALENDAR_DISCOVER";
 
 const char *AP_SSID = "TradeCalendar";
 const char *AP_PASS = "12345678";
@@ -60,6 +64,10 @@ static ST7305_U8g2 lcd(RLCD_SCK_PIN, RLCD_MOSI_PIN, RLCD_DC_PIN, RLCD_CS_PIN, RL
 static U8G2 *u8g2 = nullptr;
 static WebServer server(80);
 static File uploadFile;
+static String scheduleUrl = DEFAULT_SCHEDULE_URL;
+static String configuredSsid;
+static String configuredPass;
+static String wifiState = "starting";
 
 static bool isLeapYear(int year) {
   return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
@@ -152,6 +160,72 @@ static time_t eventEndTime(const TradeEvent &event) {
 static bool hasTime() {
   time_t now = time(nullptr);
   return now > 1700000000;
+}
+
+static void loadWifiConfig() {
+  Preferences prefs;
+  prefs.begin("wifi", true);
+  configuredSsid = prefs.getString("ssid", "");
+  configuredPass = prefs.getString("pass", "");
+  prefs.end();
+}
+
+static void saveWifiConfig(const String &ssid, const String &pass) {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.end();
+}
+
+static void clearWifiConfig() {
+  Preferences prefs;
+  prefs.begin("wifi", false);
+  prefs.clear();
+  prefs.end();
+  configuredSsid = "";
+  configuredPass = "";
+}
+
+static bool hasDefaultWifiConfig() {
+  return strcmp(WIFI_SSID, "YOUR_WIFI_NAME") != 0 && strlen(WIFI_SSID) > 0;
+}
+
+static String currentWifiState() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return "connected";
+  }
+  if (wifiState == "connecting") {
+    return "connecting";
+  }
+  if (configuredSsid.length() || hasDefaultWifiConfig()) {
+    return "disconnected";
+  }
+  return "provisioning";
+}
+
+static bool currentDateFromClock(int &year, int &month, int &day) {
+  if (!hasTime()) {
+    year = selectedYear;
+    month = selectedMonth;
+    day = selectedDay;
+    return false;
+  }
+
+  time_t now = time(nullptr);
+  struct tm nowTm = {};
+  localtime_r(&now, &nowTm);
+  year = nowTm.tm_year + 1900;
+  month = nowTm.tm_mon + 1;
+  day = nowTm.tm_mday;
+  return true;
+}
+
+static void waitForClock(uint32_t timeoutMs) {
+  uint32_t startMs = millis();
+  while (!hasTime() && millis() - startMs < timeoutMs) {
+    delay(200);
+  }
 }
 
 static bool eventIsUpcoming(const TradeEvent &event) {
@@ -765,6 +839,12 @@ static bool loadSchedule() {
     return false;
   }
 
+  int filterYear, filterMonth, filterDay;
+  currentDateFromClock(filterYear, filterMonth, filterDay);
+  selectedYear = filterYear;
+  selectedMonth = filterMonth;
+  selectedDay = filterDay;
+
   File file = SPIFFS.open(SCHEDULE_PATH, FILE_READ);
   if (!file) {
     return false;
@@ -786,6 +866,13 @@ static bool loadSchedule() {
     String fields[6];
     int fieldCount = splitCsvLine(line, fields, 6);
     if (fieldCount < 5) {
+      continue;
+    }
+    int y, m, d;
+    if (!parseDate(fields[0].c_str(), y, m, d)) {
+      continue;
+    }
+    if (y != filterYear || m != filterMonth) {
       continue;
     }
     copyField(events[eventCount].date, sizeof(events[eventCount].date), fields[0]);
@@ -840,13 +927,67 @@ static const char *displayItemName(const char *item) {
   return item;
 }
 
+static bool scheduleUrlNeedsDiscovery() {
+  return scheduleUrl.length() == 0 || scheduleUrl.indexOf("YOUR_SERVER_IP") >= 0;
+}
+
+static bool discoverScheduleServer(uint32_t timeoutMs = 5000) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiUDP udp;
+  if (!udp.begin(0)) {
+    return false;
+  }
+
+  uint32_t startMs = millis();
+  uint32_t lastSendMs = 0;
+  char buffer[160];
+
+  while (millis() - startMs < timeoutMs) {
+    uint32_t now = millis();
+    if (lastSendMs == 0 || now - lastSendMs >= 1000) {
+      udp.beginPacket(IPAddress(255, 255, 255, 255), DISCOVERY_PORT);
+      udp.write((const uint8_t *)DISCOVERY_REQUEST, strlen(DISCOVERY_REQUEST));
+      udp.endPacket();
+      lastSendMs = now;
+    }
+
+    int packetSize = udp.parsePacket();
+    if (packetSize > 0) {
+      int len = udp.read(buffer, sizeof(buffer) - 1);
+      if (len > 0) {
+        buffer[len] = '\0';
+        String response = String(buffer);
+        response.trim();
+        const String prefix = "TRADE_CALENDAR_SERVER ";
+        if (response.startsWith(prefix)) {
+          scheduleUrl = response.substring(prefix.length());
+          scheduleUrl.trim();
+          udp.stop();
+          return scheduleUrl.length() > 0;
+        }
+      }
+    }
+    delay(20);
+  }
+
+  udp.stop();
+  return false;
+}
+
 static bool fetchScheduleFromServer() {
   if (WiFi.status() != WL_CONNECTED) {
     return false;
   }
 
+  if (scheduleUrlNeedsDiscovery() && !discoverScheduleServer()) {
+    return false;
+  }
+
   HTTPClient http;
-  if (!http.begin(SCHEDULE_URL)) {
+  if (!http.begin(scheduleUrl)) {
     return false;
   }
 
@@ -904,6 +1045,26 @@ static String jsonEscape(const String &value) {
   return escaped;
 }
 
+static String htmlEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length() + 8);
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (c == '&') {
+      escaped += "&amp;";
+    } else if (c == '<') {
+      escaped += "&lt;";
+    } else if (c == '>') {
+      escaped += "&gt;";
+    } else if (c == '"') {
+      escaped += "&quot;";
+    } else {
+      escaped += c;
+    }
+  }
+  return escaped;
+}
+
 static String selectedDateString() {
   char dateText[16];
   snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d", selectedYear, selectedMonth, selectedDay);
@@ -925,11 +1086,13 @@ static String statusJson(bool ok = true, const String &message = "ok") {
   json += "\",\"selected_date\":\"" + selectedDateString() + "\"";
   json += ",\"event_count\":" + String(eventCount);
   json += ",\"selected_event_count\":" + String(countUpcomingOnSelectedDate());
+  json += ",\"wifi_state\":\"" + jsonEscape(currentWifiState()) + "\"";
+  json += ",\"configured_ssid\":\"" + jsonEscape(configuredSsid) + "\"";
   json += ",\"wifi_connected\":";
   json += WiFi.status() == WL_CONNECTED ? "true" : "false";
   json += ",\"sta_ip\":\"" + WiFi.localIP().toString() + "\"";
   json += ",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"";
-  json += ",\"schedule_url\":\"" + jsonEscape(String(SCHEDULE_URL)) + "\"";
+  json += ",\"schedule_url\":\"" + jsonEscape(scheduleUrl) + "\"";
   json += ",\"uptime_ms\":" + String(millis());
   json += "}";
   return json;
@@ -981,23 +1144,59 @@ static void handleStatus() {
 static String htmlPage() {
   String page;
   page += "<!doctype html><meta charset='utf-8'><title>Trade Calendar</title>";
-  page += "<style>body{font-family:Arial,sans-serif;max-width:760px;margin:32px auto;line-height:1.5}code,pre{background:#f4f4f4;padding:8px;display:block}button{padding:10px 18px}</style>";
-  page += "<h2>Trade Calendar Upload</h2>";
+  page += "<style>body{font-family:Arial,sans-serif;max-width:760px;margin:32px auto;line-height:1.5;color:#1f2937}section{border:1px solid #e5e7eb;border-radius:10px;padding:16px;margin:14px 0;background:#fff}label{display:block;margin:10px 0 4px;font-weight:700}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #d1d5db;border-radius:8px}code,pre{background:#f4f4f4;padding:8px;display:block;border-radius:8px}button,a.btn{display:inline-block;padding:10px 18px;border-radius:8px;border:0;background:#2563eb;color:#fff;text-decoration:none;font-weight:700}a{color:#2563eb}.muted{color:#6b7280}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}</style>";
+  page += "<h2>Trade Calendar</h2>";
+  page += "<section><h3>WiFi 配网</h3>";
+  page += "<p class='muted'>连不上办公室 WiFi 时，手机连接热点 <b>";
+  page += AP_SSID;
+  page += "</b>，打开 <b>192.168.4.1</b>，在这里输入 WiFi。</p>";
+  page += "<p>状态：<b>" + htmlEscape(currentWifiState()) + "</b><br>当前 WiFi：<b>" + htmlEscape(configuredSsid.length() ? configuredSsid : String("-")) + "</b><br>STA IP：<b>" + WiFi.localIP().toString() + "</b><br>AP IP：<b>" + WiFi.softAPIP().toString() + "</b></p>";
+  page += "<form method='POST' action='/wifi'>";
+  page += "<label>WiFi 名称</label><input name='ssid' required value='" + htmlEscape(configuredSsid) + "'>";
+  page += "<label>WiFi 密码</label><input name='pass' type='password' placeholder='留空表示无密码'>";
+  page += "<p class='row'><button>保存并重启</button><a class='btn' href='/wifi/clear'>清除配置</a></p>";
+  page += "</form></section>";
+  page += "<section><h3>交易日历数据</h3>";
   page += "<p>Upload <code>schedule.csv</code>. Fields must be:</p>";
   page += "<pre>date,start,end,item,target\n2026-05-06,09:00,11:30,D-UserTransfer,2026-05-08~2026-05-12</pre>";
   page += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
   page += "<input type='file' name='file' accept='.csv'> <button>Upload</button></form>";
   page += "<p>Loaded rows: " + String(eventCount) + "</p>";
   page += "<p><a href='/schedule.csv'>Download current CSV</a></p>";
-  page += "<p>WiFi IP: " + WiFi.localIP().toString() + " / AP IP: " + WiFi.softAPIP().toString() + "</p>";
+  page += "<p>Schedule URL: <code>" + htmlEscape(scheduleUrl) + "</code></p>";
   page += "<p>Control: <a href='/refresh'>refresh</a> · <a href='/cover'>cover</a> · <a href='/calendar'>calendar</a> · <a href='/next'>next</a> · <a href='/prev'>prev</a> · <a href='/status'>status</a></p>";
+  page += "</section>";
   return page;
+}
+
+static void handleWifiSave() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  ssid.trim();
+  if (!ssid.length()) {
+    server.send(400, "text/html; charset=utf-8", "<meta charset='utf-8'>WiFi 名称不能为空。<p><a href='/'>返回</a></p>");
+    return;
+  }
+
+  saveWifiConfig(ssid, pass);
+  server.send(200, "text/html; charset=utf-8", "<meta charset='utf-8'>WiFi 已保存，开发板正在重启。<p>稍后重新打开开发板页面。</p>");
+  delay(700);
+  ESP.restart();
+}
+
+static void handleWifiClear() {
+  clearWifiConfig();
+  server.send(200, "text/html; charset=utf-8", "<meta charset='utf-8'>WiFi 配置已清除，开发板正在重启。<p>稍后连接 TradeCalendar 热点重新配置。</p>");
+  delay(700);
+  ESP.restart();
 }
 
 static void setupWebServer() {
   server.on("/", HTTP_GET, []() {
     server.send(200, "text/html; charset=utf-8", htmlPage());
   });
+  server.on("/wifi", HTTP_POST, handleWifiSave);
+  server.on("/wifi/clear", HTTP_GET, handleWifiClear);
 
   server.on("/schedule.csv", HTTP_GET, []() {
     if (SPIFFS.exists(SCHEDULE_PATH)) {
@@ -1052,15 +1251,30 @@ static void setupWifiAndTime() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
 
-  if (strcmp(WIFI_SSID, "YOUR_WIFI_NAME") != 0) {
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  loadWifiConfig();
+  String ssid = configuredSsid;
+  String pass = configuredPass;
+  if (!ssid.length() && hasDefaultWifiConfig()) {
+    ssid = WIFI_SSID;
+    pass = WIFI_PASS;
+  }
+
+  if (ssid.length()) {
+    wifiState = "connecting";
+    WiFi.begin(ssid.c_str(), pass.c_str());
     uint32_t startMs = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startMs < 12000) {
       delay(250);
     }
+    wifiState = WiFi.status() == WL_CONNECTED ? "connected" : "provisioning";
+  } else {
+    wifiState = "provisioning";
   }
 
-  configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com", "pool.ntp.org");
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(8 * 3600, 0, "ntp.aliyun.com", "ntp.tencent.com", "pool.ntp.org");
+    waitForClock(5000);
+  }
 }
 
 static ButtonState keyButton = {KEY_PIN, false, false, 0};
